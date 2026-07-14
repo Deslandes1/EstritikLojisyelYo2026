@@ -5,8 +5,19 @@ import cssutils
 import re
 import io
 import base64
+import random
 from urllib.parse import urljoin, urlparse
 import os
+
+# Attempt to import selenium – if not installed, fall back gracefully
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
 
 # ---------- PAGE CONFIG ----------
 st.set_page_config(
@@ -18,23 +29,72 @@ st.set_page_config(
 st.title("🌐 Web Structure Cloner")
 st.markdown("Paste any website URL, and I'll extract its CSS and layout to generate a custom Streamlit app template.")
 
+# ---------- USER AGENTS FOR ROTATION ----------
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
+
 # ---------- FUNCTIONS ----------
-def fetch_html(url):
-    """Fetch HTML content from URL."""
+def fetch_html_requests(url):
+    """Fetch HTML using requests with realistic headers."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
     }
     try:
-        resp = requests.get(url, headers=headers, timeout=10)
+        session = requests.Session()
+        session.headers.update(headers)
+        resp = session.get(url, timeout=15)
         resp.raise_for_status()
+        # If the response is compressed, requests automatically decompresses
         return resp.text
     except Exception as e:
-        st.error(f"Failed to fetch URL: {e}")
+        st.error(f"Requests fetch failed: {e}")
         return None
 
-def get_absolute_url(base, link):
-    """Resolve relative URLs."""
-    return urljoin(base, link)
+def fetch_html_selenium(url):
+    """Fetch HTML using Selenium (headless Chrome) for dynamic content."""
+    if not SELENIUM_AVAILABLE:
+        st.error("Selenium is not installed. Please install it: `pip install selenium webdriver-manager`")
+        return None
+    try:
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--window-size=1920,1080")
+        chrome_options.add_argument(f"--user-agent={random.choice(USER_AGENTS)}")
+        # Additional options to avoid detection
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_experimental_option('useAutomationExtension', False)
+        
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=chrome_options
+        )
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        driver.get(url)
+        driver.implicitly_wait(5)  # Wait for dynamic content
+        html = driver.page_source
+        driver.quit()
+        return html
+    except Exception as e:
+        st.error(f"Selenium error: {e}")
+        return None
 
 def extract_css(url, html):
     """Extract all CSS from HTML (inline, internal, external)."""
@@ -63,7 +123,7 @@ def extract_css(url, html):
     inline_css = ""
     for tag in soup.find_all(style=True):
         style = tag["style"]
-        # We'll create a rule using the tag's selector (e.g., tag.class#id)
+        # Build a simple selector based on tag, id, classes
         selector = tag.name
         if tag.get("id"):
             selector += f"#{tag['id']}"
@@ -78,7 +138,12 @@ def extract_css(url, html):
     # Remove @import and @charset (they might be absolute paths)
     combined = re.sub(r'@import\s+url\([^)]*\);', '', combined)
     combined = re.sub(r'@charset\s+"[^"]*";', '', combined)
+    # Optionally remove relative urls that might break – leave as-is
     return combined
+
+def get_absolute_url(base, link):
+    """Resolve relative URLs."""
+    return urljoin(base, link)
 
 def generate_streamlit_code(url, css, html_sample):
     """Generate a Python script that uses the extracted CSS in a Streamlit app."""
@@ -138,18 +203,35 @@ st.markdown(\"\"\"{html_content}\"\"\", unsafe_allow_html=True)
 # ---------- UI ----------
 url = st.text_input("Enter the URL of the website to clone:", placeholder="https://example.com")
 
+# Info box about limitations
+st.info("""
+💡 **Note:** Some websites (like Facebook, Instagram, and Twitter) block simple scraping requests.
+- If you get a 400 error, try using the Selenium option below.
+- For Facebook, you may need to use the official Graph API.
+- This tool works best on static websites and blogs.
+""")
+
+use_selenium = st.checkbox("🌐 Use Selenium (slower, but handles JavaScript-heavy sites)", disabled=not SELENIUM_AVAILABLE)
+
+if not SELENIUM_AVAILABLE and use_selenium:
+    st.warning("Selenium is not installed. Please install it: `pip install selenium webdriver-manager`")
+
 if st.button("🚀 Extract Structure", type="primary"):
     if not url:
         st.warning("Please enter a valid URL.")
     else:
         with st.spinner("Fetching and analyzing page..."):
-            html = fetch_html(url)
+            # Choose fetch method
+            if use_selenium and SELENIUM_AVAILABLE:
+                html = fetch_html_selenium(url)
+            else:
+                html = fetch_html_requests(url)
+            
             if html:
                 css = extract_css(url, html)
                 if not css:
                     st.warning("No CSS extracted. The page might be heavily dynamic or require JavaScript.")
                 else:
-                    # Display extracted CSS length
                     st.success(f"✅ Extracted {len(css)} characters of CSS.")
                     
                     # Generate code
@@ -174,4 +256,4 @@ if st.button("🚀 Extract Structure", type="primary"):
                 st.error("Could not fetch the page. Please check the URL and try again.")
 
 st.markdown("---")
-st.caption("ℹ️ This tool extracts static CSS and HTML structure. It works best on simple, static websites. Dynamic content (JavaScript-generated) is not captured. For advanced styling, you can manually adjust the generated code.")
+st.caption("ℹ️ This tool extracts static CSS and HTML structure. It works best on simple, static websites. Dynamic content (JavaScript-generated) is not fully captured. For advanced styling, you can manually adjust the generated code.")
